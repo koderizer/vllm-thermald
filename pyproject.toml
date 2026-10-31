@@ -1,0 +1,10 @@
+[project]
+name = "vllm-thermald"
+version = "1.1.0"
+description = "Thermal manager and read-only MCP server for a vLLM Docker container"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[tool.ruff]
+line-length = 120
