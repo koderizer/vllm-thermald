@@ -1,10 +1,39 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "vllm-thermald"
-version = "1.1.0"
-description = "Thermal manager and read-only MCP server for a vLLM Docker container"
+dynamic = ["version"]
+description = "Keeps a vLLM container from overheating an NVIDIA DGX Spark, and lets AI agents read their hardware temperature over MCP"
 readme = "README.md"
 requires-python = ">=3.9"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "koderizer" }]
+keywords = ["vllm", "dgx-spark", "nvidia", "thermal", "mcp", "gpu", "daemon"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: No Input/Output (Daemon)",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Monitoring",
+]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/koderizer/vllm-thermald"
+Issues = "https://github.com/koderizer/vllm-thermald/issues"
+
+[project.scripts]
+vllm-thermald = "vllm_thermald.__main__:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "vllm_thermald.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.ruff]
 line-length = 120

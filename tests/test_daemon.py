@@ -3,8 +3,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import vllm_thermald
-from vllm_thermald import KILL, PAUSE, START, UNPAUSE, Config, Controller, Reading, parse_nvidia
+from vllm_thermald import daemon as vllm_thermald
+from vllm_thermald.daemon import KILL, PAUSE, START, UNPAUSE, Config, Controller, Reading, parse_nvidia
 
 COOL = Reading(gpu=45, board=50)
 WARM = Reading(gpu=75, board=80)  # between resume and pause

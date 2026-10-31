@@ -9,10 +9,10 @@ from dataclasses import asdict
 from pathlib import Path
 from unittest import mock
 
-import vllm_thermald as daemon
-import vllm_thermald_mcp as mcp
+from vllm_thermald import daemon
+from vllm_thermald import mcp_server as mcp
 
-HERE = Path(__file__).parent
+SRC = str(Path(__file__).resolve().parent.parent / "src")
 NOW = 1_800_000_000.0
 
 
@@ -111,7 +111,7 @@ class ToolTests(Base):
     def test_policy_reports_daemons_active_config_not_defaults(self):
         cfg = asdict(daemon.Config(pause_gpu=80, resume_gpu=65))
         self.write_status(config=cfg)
-        self.assertEqual(mcp.thermal_policy(self.dir)["active_thresholds_c"]["pause"]["gpu"], 80)
+        self.assertEqual(mcp.thermal_policy(self.dir)["active_limits_c"]["pause"]["gpu"], 80)
 
     def test_status_marks_docker_failure_unprotected(self):
         self.write_status(container_status="unknown")
@@ -162,7 +162,7 @@ class ToolTests(Base):
 
     def test_history_limits_series_points(self):
         self.write_csv([(NOW - i, 50, 60, "running") for i in range(600, 0, -1)])
-        self.assertLessEqual(len(mcp.thermal_history(self.dir, NOW, minutes=30, points=5)["series"]), 5)
+        self.assertLessEqual(len(mcp.thermal_history(self.dir, NOW, minutes=30)["series"]), mcp.SERIES_POINTS)
 
     def test_history_empty_and_corrupt_lines(self):
         (self.dir / "thermal.csv").write_text("garbage\n1,2\n")
@@ -302,9 +302,9 @@ class ProtocolTests(Base):
     def test_stdio_survives_invalid_utf8(self):
         (self.dir / "vllm-thermald").mkdir()
         request = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "ping"}).encode()
-        env = {**os.environ, "XDG_STATE_HOME": str(self.dir), "PYTHONDONTWRITEBYTECODE": "1"}
+        env = {**os.environ, "XDG_STATE_HOME": str(self.dir), "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": SRC}
         out = subprocess.run(
-            [sys.executable, str(HERE / "vllm_thermald_mcp.py")],
+            [sys.executable, "-m", "vllm_thermald", "mcp"],
             input=b"\xff\xfe garbage\n" + request + b"\n", capture_output=True, env=env, timeout=20,
         ).stdout.decode().splitlines()
         self.assertEqual(json.loads(out[-1])["id"], 2)
@@ -317,9 +317,9 @@ class ProtocolTests(Base):
             json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}),
             json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "thermal_status"}}),
         ]
-        env = {**os.environ, "XDG_STATE_HOME": str(self.dir), "PYTHONDONTWRITEBYTECODE": "1"}
+        env = {**os.environ, "XDG_STATE_HOME": str(self.dir), "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": SRC}
         out = subprocess.run(
-            [sys.executable, str(HERE / "vllm_thermald_mcp.py")],
+            [sys.executable, "-m", "vllm_thermald", "mcp"],
             input="\n".join(lines) + "\n", capture_output=True, text=True, env=env, timeout=20,
         ).stdout.splitlines()
         self.assertEqual(json.loads(out[0])["error"]["code"], -32700)

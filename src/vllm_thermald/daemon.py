@@ -1,10 +1,11 @@
-#!/usr/bin/env python3
-"""Thermal manager for a vLLM Docker container.
+# Copyright 2026 koderizer
+# SPDX-License-Identifier: Apache-2.0
+"""The thermal control loop.
 
 Pausing is the normal response to heat: `docker pause` removes GPU load within
 seconds, keeps the model loaded, and in-flight requests resume afterwards.
 Killing is the last resort, because a restart reloads the model and runs
-FlashInfer autotune, which is the hottest phase of the container's life.
+autotune, which is the hottest phase of the container's life.
 
     running --(hot)--> paused --(cool)--> running
        |                  |
@@ -12,16 +13,12 @@ FlashInfer autotune, which is the hottest phase of the container's life.
        v                  v
      killed --(cooldown elapsed and cold)--> running
 
-The daemon fails safe: when a sensor is unavailable it treats temperatures as
-unknown rather than cool, and an invalid config falls back to the defaults
-rather than leaving the container unprotected.
-
-Commands: run | status | hold | release | check-config
+It fails safe: a missing sensor is unknown rather than cool, and an invalid
+config falls back to default limits rather than leaving the container unprotected.
 """
 
 from __future__ import annotations
 
-import argparse
 import dataclasses
 import fcntl
 import glob
@@ -32,7 +29,6 @@ import re
 import signal
 import socket
 import subprocess
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,41 +42,31 @@ CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / 
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
 PAUSE, UNPAUSE, KILL, START = "pause", "unpause", "kill", "start"
-HOT_LOG_GPU_C, HOT_LOG_BOARD_C = 75, 85
-CSV_MAX_BYTES = 20_000_000
-EVENT_LOG_MAX_BYTES = 1_000_000
+ACTION_TIMEOUT_S = {PAUSE: 10, UNPAUSE: 10, KILL: 10, START: 30}
 STALE_AFTER_S = 30  # longer than the worst-case loop: sensor + inspect + action timeouts
-SENSOR_TIMEOUT_S = 5
-DOCKER_STATUS_TIMEOUT_S = 5
-DOCKER_ACTION_TIMEOUT_S = {PAUSE: 10, UNPAUSE: 10, KILL: 10, START: 30}
 KILL_ATTRIBUTION_S = 30  # an exit this soon after a kill request is attributed to it
 EVENT_REPEAT_S = 60  # identical events are written at most this often
-MIN_VALID_C, MAX_VALID_C = -20, 150  # readings outside this range are treated as missing
-
+HOT_LOG_GPU_C, HOT_LOG_BOARD_C = 75, 85  # above these, log every reading rather than every 5s
+CSV_MAX_BYTES, EVENT_LOG_MAX_BYTES = 20_000_000, 1_000_000
 UP_STATUSES = ("running", "paused")
 UNCERTAIN_STATUSES = ("unknown", "restarting", "removing")  # say nothing about whether it exited
 CONTAINER_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
-LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 
 @dataclass(frozen=True)
 class Config:
-    """Defaults come from a run that died at GPU 89C / board 96C with thermal slowdown active."""
+    """The default limits come from one DGX Spark that died at GPU 89C / board 96C."""
 
-    container: str = "vllm-spark-128gb-qwen38-27b"
+    container: str = "vllm"
     vllm_url: str = "http://127.0.0.1:8000"
     poll_s: float = 1.0
-    # Pause when either sensor reaches these.
-    pause_gpu: int = 85
+    pause_gpu: int = 85  # pause when either sensor reaches its limit
     pause_board: int = 92
-    # Unpause when both sensors are at or below these.
-    resume_gpu: int = 70
+    resume_gpu: int = 70  # unpause when both sensors are at or below these
     resume_board: int = 75
-    # Kill when either sensor reaches these.
-    kill_gpu: int = 90
+    kill_gpu: int = 90  # kill when either sensor reaches its limit
     kill_board: int = 96
-    # (Re)start a stopped container only when both sensors are at or below these.
-    start_gpu: int = 60
+    start_gpu: int = 60  # start a stopped container when both are at or below these
     start_board: int = 65
     hw_slowdown_samples: int = 3  # consecutive hardware-slowdown readings before pausing
     min_pause_s: float = 30  # avoids rapid pause/unpause cycling
@@ -98,26 +84,19 @@ class Config:
             if field.name in ("container", "vllm_url"):
                 if not isinstance(value, str):
                     raise ValueError(f"{field.name} must be a string")
-            elif isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise ValueError(f"{field.name} must be a number")
-            elif value < 0:
-                raise ValueError(f"{field.name} must not be negative")
-        if self.poll_s <= 0:
-            raise ValueError("poll_s must be positive")
-        if self.hw_slowdown_samples < 1:
-            raise ValueError("hw_slowdown_samples must be at least 1")
-        if self.cooldown_s > self.max_cooldown_s:
-            raise ValueError("cooldown_s must not exceed max_cooldown_s")
+            elif isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+                raise ValueError(f"{field.name} must be a non-negative number")
+        if self.poll_s <= 0 or self.hw_slowdown_samples < 1 or self.cooldown_s > self.max_cooldown_s:
+            raise ValueError("need poll_s > 0, hw_slowdown_samples >= 1, cooldown_s <= max_cooldown_s")
         if not CONTAINER_NAME.match(self.container):
             raise ValueError(f"invalid container name: {self.container!r}")
         url = urlsplit(self.vllm_url)
-        if url.scheme != "http" or url.hostname not in LOOPBACK_HOSTS:
+        if url.scheme != "http" or url.hostname not in ("127.0.0.1", "localhost", "::1"):
             raise ValueError("vllm_url must be an http:// loopback address")
-        ordered = (
+        if not (
             self.start_gpu <= self.resume_gpu < self.pause_gpu < self.kill_gpu
             and self.start_board <= self.resume_board < self.pause_board < self.kill_board
-        )
-        if not ordered:
+        ):
             raise ValueError("thresholds must satisfy start <= resume < pause < kill")
 
 
@@ -140,8 +119,8 @@ class Decision:
 class Controller:
     """Decides what to do from sensors and container status. Performs no I/O.
 
-    State is derived from observed container status rather than from the
-    actions it requested, so a failed docker command is simply retried.
+    State is derived from observed status rather than from requested actions,
+    so a failed docker command is simply retried.
     """
 
     def __init__(self, cfg: Config) -> None:
@@ -163,10 +142,6 @@ class Controller:
         """True only when both sensors confirm it. A missing sensor is never treated as cool."""
         return r.gpu is not None and r.board is not None and r.gpu <= gpu and r.board <= board
 
-    def _backoff(self, now: float) -> None:
-        self.not_before = now + self.cooldown
-        self.cooldown = min(self.cooldown * 2, self.cfg.max_cooldown_s)
-
     def _observe(self, status: str, now: float) -> None:
         if status in UNCERTAIN_STATUSES:
             return  # keep every timer: a transient Docker failure must not erase a backoff
@@ -175,9 +150,8 @@ class Controller:
             self.start_pending = False
             if self.running_since is None:
                 self.running_since = now
-        if status == "running" and self.running_since is not None:
-            if now - self.running_since >= self.cfg.stable_s:
-                self.cooldown = self.cfg.cooldown_s
+        if status == "running" and now - self.running_since >= self.cfg.stable_s:
+            self.cooldown = self.cfg.cooldown_s
         if status != "paused":
             self.paused_since = None
         elif self.paused_since is None:
@@ -186,7 +160,8 @@ class Controller:
             ran_for = now - self.running_since if self.running_since is not None else 0.0
             killed = self.last_kill_at is not None and now - self.last_kill_at <= KILL_ATTRIBUTION_S
             if killed or self.start_pending or ran_for < self.cfg.early_exit_s:
-                self._backoff(now)
+                self.not_before = now + self.cooldown
+                self.cooldown = min(self.cooldown * 2, self.cfg.max_cooldown_s)
             self.start_pending = False
         if not up:
             self.running_since = None
@@ -199,9 +174,6 @@ class Controller:
             "paused_for_s": since(self.paused_since),
             "running_for_s": since(self.running_since),
             "restart_wait_s": round(max(0.0, self.not_before - now), 1),
-            "next_cooldown_s": self.cooldown,
-            "hw_slowdown_consecutive": self.hw_count,
-            "sensor_missing_for_s": since(self.sensor_missing_since),
         }
 
     def restore_backoff(self, remaining_s: float, cooldown_s: float, now: float) -> None:
@@ -268,7 +240,7 @@ class Controller:
 
 
 def _valid_temp(value: int) -> Optional[int]:
-    return value if MIN_VALID_C <= value <= MAX_VALID_C else None
+    return value if -20 <= value <= 150 else None
 
 
 def parse_nvidia(out: str) -> dict:
@@ -276,9 +248,8 @@ def parse_nvidia(out: str) -> dict:
     parts = [p.strip() for p in lines[0].split(",")] if lines else []
     if len(parts) < 5:
         return {}
-    gpu = _valid_temp(int(parts[0])) if parts[0].lstrip("-").isdigit() else None
     return {
-        "gpu": gpu,
+        "gpu": _valid_temp(int(parts[0])) if parts[0].lstrip("-").isdigit() else None,
         "hw_slowdown": parts[1] == "Active",
         "sw_slowdown": parts[2] == "Active",
         "power": parts[3],
@@ -307,7 +278,7 @@ def read_sensors() -> Reading:
     try:
         out = subprocess.run(
             ["nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=SENSOR_TIMEOUT_S, check=True,
+            capture_output=True, text=True, timeout=5, check=True,
         ).stdout
         fields.update(parse_nvidia(out))
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
@@ -319,13 +290,13 @@ class Docker:
     def __init__(self, container: str) -> None:
         self.container = container
 
-    def _run(self, timeout: float, *args: str) -> subprocess.CompletedProcess:
-        return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=timeout)
-
     def status(self) -> str:
         """Container status, `missing` if absent, or `unknown` if Docker cannot answer."""
         try:
-            p = self._run(DOCKER_STATUS_TIMEOUT_S, "inspect", "-f", "{{.State.Status}}", self.container)
+            p = subprocess.run(
+                ["docker", "inspect", "-f", "{{.State.Status}}", self.container],
+                capture_output=True, text=True, timeout=5,
+            )
         except (OSError, subprocess.SubprocessError):
             return "unknown"
         if p.returncode == 0:
@@ -335,39 +306,27 @@ class Docker:
     def act(self, action: str) -> tuple:
         """Returns (succeeded, error text)."""
         try:
-            p = self._run(DOCKER_ACTION_TIMEOUT_S[action], action, self.container)
+            p = subprocess.run(
+                ["docker", action, self.container],
+                capture_output=True, text=True, timeout=ACTION_TIMEOUT_S[action],
+            )
         except (OSError, subprocess.SubprocessError) as exc:
             return False, str(exc)
         return p.returncode == 0, p.stderr.strip()
 
 
-def _append_synced(path: Path, line: str) -> None:
+def _append_synced(path: Path, line: str, max_bytes: int) -> None:
+    """Synced so the readings just before a sudden power loss survive it."""
+    if path.exists() and path.stat().st_size > max_bytes:
+        path.replace(path.with_name(path.name + ".1"))
     with open(path, "a") as f:
         f.write(line)
         f.flush()
         os.fsync(f.fileno())
 
 
-def _rotate(path: Path, suffix: str, max_bytes: int) -> None:
-    if path.exists() and path.stat().st_size > max_bytes:
-        path.replace(path.with_suffix(suffix))
-
-
-class ThermalLog:
-    """Synced CSV, so the readings just before a sudden power loss survive it."""
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.last = 0.0
-
-    def write(self, r: Reading, status: str, now: float) -> None:
-        hot = (r.gpu or 0) >= HOT_LOG_GPU_C or (r.board or 0) >= HOT_LOG_BOARD_C
-        if not hot and now - self.last < 5:
-            return
-        self.last = now
-        _rotate(self.path, ".csv.1", CSV_MAX_BYTES)
-        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
-        _append_synced(self.path, f"{stamp},{r.gpu},{r.board},{r.power},{r.util},{r.hw_slowdown},{r.sw_slowdown},{status}\n")
+def _stamp(t: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
 
 
 class EventLog:
@@ -384,12 +343,11 @@ class EventLog:
         if key == self.last_key and now - self.last_time < EVENT_REPEAT_S:
             return  # a retrying action must not push older events out of the log
         self.last_key, self.last_time = key, now
-        record = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)), "event": event, **fields}
+        record = {"ts": _stamp(now), "event": event, **fields}
         if r is not None:
             record.update(gpu_c=r.gpu, board_c=r.board, power=r.power, util=r.util)
         try:
-            _rotate(self.path, ".jsonl.1", EVENT_LOG_MAX_BYTES)
-            _append_synced(self.path, json.dumps(record) + "\n")
+            _append_synced(self.path, json.dumps(record) + "\n", EVENT_LOG_MAX_BYTES)
         except OSError as exc:
             log.error("cannot write event: %s", exc)
 
@@ -398,28 +356,6 @@ def _write_json(path: Path, data: dict) -> None:
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data))
     tmp.replace(path)
-
-
-def write_status(
-    state_dir: Path, r: Reading, status: str, ctl: Controller, hold: bool, counts: dict, now: float, started: float
-) -> None:
-    _write_json(state_dir / "status.json", {
-        "updated": time.time(),
-        "daemon_started": started,
-        "daemon_pid": os.getpid(),
-        "container": ctl.cfg.container,
-        "container_status": status,
-        "gpu_c": r.gpu,
-        "board_c": r.board,
-        "power": r.power,
-        "util": r.util,
-        "hw_slowdown": r.hw_slowdown,
-        "sw_slowdown": r.sw_slowdown,
-        "hold": hold,
-        "counts": counts,
-        "controller": ctl.snapshot(now),
-        "config": dataclasses.asdict(ctl.cfg),
-    })
 
 
 def load_config(path: Path = CONFIG_PATH) -> Config:
@@ -440,15 +376,11 @@ def load_config_or_defaults(path: Path = CONFIG_PATH) -> tuple:
     try:
         return load_config(path), None
     except ValueError as exc:
-        return _defaults_for_same_container(path), str(exc)
-
-
-def _defaults_for_same_container(path: Path) -> Config:
-    """Default thresholds, but still the configured container: the wrong one would leave it unprotected."""
-    try:
-        return Config(container=json.loads(path.read_text())["container"])
+        error = str(exc)
+    try:  # default limits, but still the configured container
+        return Config(container=json.loads(path.read_text())["container"]), error
     except (OSError, ValueError, KeyError, TypeError):
-        return Config()
+        return Config(), error
 
 
 def save_backoff(state_dir: Path, ctl: Controller, mono_now: float, wall_now: float) -> None:
@@ -505,7 +437,6 @@ class Daemon:
         self.state_dir = state_dir
         self.docker = Docker(cfg.container)
         self.ctl = Controller(cfg)
-        self.csv = ThermalLog(state_dir / "thermal.csv")
         self.events = EventLog(state_dir / "events.jsonl")
         self.hold_file = state_dir / "hold"
         self.counts = {PAUSE: 0, UNPAUSE: 0, KILL: 0, START: 0}
@@ -513,30 +444,50 @@ class Daemon:
         self.last_status: Optional[str] = None
         self.last_sensors: Optional[tuple] = None
         self.last_backoff: Optional[tuple] = None
-        self.last_summary = time.monotonic()
+        self.last_csv = 0.0
 
     def _note_changes(self, r: Reading, status: str) -> None:
         if status != self.last_status:
             log.info("container status: %s -> %s", self.last_status, status)
             if status == "missing":
-                log.error("container %s does not exist; create it with the vLLM launch script", self.cfg.container)
+                log.error("container %s does not exist", self.cfg.container)
             self.events.write("container_status", r, previous=self.last_status, status=status)
             self.last_status = status
         sensors = (r.gpu is not None, r.board is not None)
         if sensors != self.last_sensors:
             if not all(sensors):
                 log.error("temperature sensor unavailable: gpu=%s board=%s", r.gpu, r.board)
-            elif self.last_sensors is not None:
-                log.info("temperature sensors recovered")
             if self.last_sensors is not None or not all(sensors):
                 self.events.write("sensors", r, gpu_ok=sensors[0], board_ok=sensors[1])
             self.last_sensors = sensors
 
     def _persist(self, r: Reading, status: str, hold: bool, now: float) -> None:
         wall = time.time()
+        hot = (r.gpu or 0) >= HOT_LOG_GPU_C or (r.board or 0) >= HOT_LOG_BOARD_C
         try:
-            self.csv.write(r, status, wall)
-            write_status(self.state_dir, r, status, self.ctl, hold, self.counts, now, self.started)
+            if hot or wall - self.last_csv >= 5:
+                self.last_csv = wall
+                _append_synced(
+                    self.state_dir / "thermal.csv",
+                    f"{_stamp(wall)},{r.gpu},{r.board},{r.power},{r.util},{r.hw_slowdown},{r.sw_slowdown},{status}\n",
+                    CSV_MAX_BYTES,
+                )
+            _write_json(self.state_dir / "status.json", {
+                "updated": wall,
+                "daemon_started": self.started,
+                "container": self.cfg.container,
+                "container_status": status,
+                "gpu_c": r.gpu,
+                "board_c": r.board,
+                "power": r.power,
+                "util": r.util,
+                "hw_slowdown": r.hw_slowdown,
+                "sw_slowdown": r.sw_slowdown,
+                "hold": hold,
+                "counts": self.counts,
+                "controller": self.ctl.snapshot(now),
+                "config": dataclasses.asdict(self.cfg),
+            })
             backoff = (self.ctl.not_before, self.ctl.cooldown)
             if backoff != self.last_backoff:
                 save_backoff(self.state_dir, self.ctl, now, wall)
@@ -555,23 +506,17 @@ class Daemon:
             ok, error = self.docker.act(decision.action)
             if ok:
                 self.counts[decision.action] += 1
-            level = logging.WARNING if ok else logging.ERROR
-            log.log(level, "%s %s: %s (%s %s) %s", decision.action.upper(), "ok" if ok else "FAILED",
-                    decision.reason, r.power, r.util, error)
+            log.log(logging.WARNING if ok else logging.ERROR, "%s %s: %s (%s %s) %s", decision.action.upper(),
+                    "ok" if ok else "FAILED", decision.reason, r.power, r.util, error)
             self.events.write(decision.action, r, reason=decision.reason, ok=ok)
         self._persist(r, status, hold, now)
-        if now - self.last_summary >= 300:
-            log.info("gpu=%sC board=%sC %s %s status=%s counts=%s", r.gpu, r.board, r.power, r.util, status, self.counts)
-            self.last_summary = now
 
     def shutdown(self) -> None:
         """Nothing else would unfreeze the container, unless it is hot or held: then leave it to the next daemon."""
         r = read_sensors()
-        status = self.docker.status()
-        if status == "paused" and not self.hold_file.exists() and self.ctl.at_or_below(
+        if self.docker.status() == "paused" and not self.hold_file.exists() and self.ctl.at_or_below(
             r, self.cfg.resume_gpu, self.cfg.resume_board
         ):
-            log.info("exiting: unpausing container")
             self.docker.act(UNPAUSE)
         log.warning("exiting: vLLM has no thermal protection until the daemon runs again")
         self.events.write("daemon_stopped", r)
@@ -593,7 +538,7 @@ def run(state_dir: Path = STATE_DIR, config_path: Path = CONFIG_PATH) -> int:
     log.info("started: %s", dataclasses.asdict(cfg))
     daemon.events.write("daemon_started")
     if error:
-        log.error("invalid config, using defaults: %s", error)
+        log.error("invalid config, using default limits: %s", error)
         daemon.events.write("config_error", reason=error)
     sd_notify("READY=1")
     while not stopping:
@@ -607,51 +552,3 @@ def run(state_dir: Path = STATE_DIR, config_path: Path = CONFIG_PATH) -> int:
     daemon.shutdown()
     lock.close()
     return 0
-
-
-def show_status(state_dir: Path = STATE_DIR) -> int:
-    try:
-        s = json.loads((state_dir / "status.json").read_text())
-        age = time.time() - s["updated"]
-    except (OSError, ValueError, KeyError, TypeError):
-        print("no status yet; is the daemon running?")
-        return 1
-    stale = age > STALE_AFTER_S
-    print(f"container : {s.get('container')} ({s.get('container_status')})")
-    print(f"sensors   : gpu {s.get('gpu_c')}C, board {s.get('board_c')}C, {s.get('power')}, util {s.get('util')}")
-    print(f"hold      : {'on' if s.get('hold') else 'off'}")
-    print(f"actions   : {s.get('counts')}")
-    print(f"updated   : {age:.0f}s ago" + ("  ** STALE: daemon may be down **" if stale else ""))
-    return 1 if stale else 0
-
-
-def main(argv: Optional[list] = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", choices=["run", "status", "hold", "release", "check-config"], help=(
-        "hold keeps vLLM from being started or unpaused (use it before stopping vLLM on purpose); "
-        "heat protection stays active. release undoes it. check-config validates the config file."))
-    args = parser.parse_args(argv)
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s", stream=sys.stdout)
-    if args.command == "run":
-        return run()
-    if args.command == "status":
-        return show_status()
-    if args.command == "check-config":
-        try:
-            print(json.dumps(dataclasses.asdict(load_config()), indent=2))
-            return 0
-        except ValueError as exc:
-            print(f"invalid: {exc}", file=sys.stderr)
-            return 1
-    prepare_state_dir(STATE_DIR)
-    hold_file = STATE_DIR / "hold"
-    if args.command == "hold":
-        hold_file.touch()
-    else:
-        hold_file.unlink(missing_ok=True)
-    print(f"hold {'on' if args.command == 'hold' else 'off'}")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

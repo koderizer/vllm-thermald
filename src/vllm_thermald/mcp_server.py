@@ -1,9 +1,10 @@
-#!/usr/bin/env python3
-"""Read-only MCP server (stdio) exposing vllm-thermald and vLLM readings to an agent.
+# Copyright 2026 koderizer
+# SPDX-License-Identifier: Apache-2.0
+"""Read-only MCP server (stdio) exposing thermal and vLLM readings to an agent.
 
-It runs apart from the daemon and only reads the daemon's state files, so a fault
-here cannot affect thermal protection. No tool can change thresholds, hold, or
-control the container: an agent must not be able to disable its own heat protection.
+It only reads the daemon's state files, so a fault here cannot affect protection.
+No tool can change limits, hold, or control the container: an agent must not be
+able to disable its own heat protection.
 """
 
 from __future__ import annotations
@@ -20,18 +21,17 @@ import urllib.request
 from pathlib import Path
 from typing import Optional
 
-from vllm_thermald import CONFIG_DIR, STALE_AFTER_S, STATE_DIR
+from . import __version__
+from .daemon import CONFIG_DIR, STALE_AFTER_S, STATE_DIR
 
-SERVER_NAME = "vllm-thermald"
-SERVER_VERSION = "1.1.0"
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
-DEFAULT_VLLM_URL = "http://127.0.0.1:8000"
 OBSERVATIONS_PATH = CONFIG_DIR / "observations.json"
 OBSERVATIONS_MAX_BYTES = 64_000
 HTTP_MAX_BYTES = 8_000_000
-GAP_S = 60
 HISTORY_TAIL_BYTES = 4_000_000
 TREND_TAIL_BYTES = 64_000
+SERIES_POINTS = 30
+GAP_S = 60
 SECRET_FLAG = re.compile(r"token$|api.?key|secret|password|credential|^auth", re.I)
 SECRET_VALUE = re.compile(r"hf_[A-Za-z0-9]{10,}|sk-[A-Za-z0-9_-]{10,}|nvapi-[A-Za-z0-9_-]{10,}")
 
@@ -39,10 +39,10 @@ INSTRUCTIONS = (
     "Physical temperature and state of the machine running the LLM you are thinking with. "
     "This is hardware temperature, not sampling temperature. Read thermal_policy once to learn "
     "the rules, then check thermal_status before long or heavy work. Read-only: you cannot change "
-    "thresholds or control the daemon; ask a human for that."
+    "limits or control the daemon; ask a human for that."
 )
 
-# Without a loopback bypass, an http_proxy variable would send these local requests to the proxy.
+# Without this, an http_proxy variable would send these local requests to the proxy.
 _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
@@ -73,14 +73,12 @@ def protection_issues(s: dict, state: str) -> list:
     """Reasons the daemon may be unable to protect vLLM right now."""
     if state == "daemon_down":
         return ["the daemon is not updating, so nothing is watching the temperature"]
-    issues = []
-    if s.get("container_status") == "unknown":
-        issues.append("Docker is not answering, so vLLM cannot be paused or killed")
-    if s.get("gpu_c") is None:
-        issues.append("the GPU temperature is unavailable")
-    if s.get("board_c") is None:
-        issues.append("the board temperature is unavailable")
-    return issues
+    checks = (
+        (s.get("container_status") == "unknown", "Docker is not answering, so vLLM cannot be paused or killed"),
+        (s.get("gpu_c") is None, "the GPU temperature is unavailable"),
+        (s.get("board_c") is None, "the board temperature is unavailable"),
+    )
+    return [message for failed, message in checks if failed]
 
 
 def derive_headroom(s: dict, state: str) -> dict:
@@ -91,15 +89,7 @@ def derive_headroom(s: dict, state: str) -> dict:
     if state != "normal" or "pause_gpu" not in cfg or "pause_board" not in cfg:
         return {"level": "none", "degrees_to_pause": None}
     margin = min(cfg["pause_gpu"] - s["gpu_c"], cfg["pause_board"] - s["board_c"])
-    level = "ample" if margin >= 20 else "moderate" if margin >= 10 else "low"
-    return {"level": level, "degrees_to_pause": margin}
-
-
-def parse_stamp(stamp: str) -> Optional[float]:
-    try:
-        return float(calendar.timegm(time.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ")))
-    except ValueError:
-        return None
+    return {"level": "ample" if margin >= 20 else "moderate" if margin >= 10 else "low", "degrees_to_pause": margin}
 
 
 def _tail_lines(path: Path, max_bytes: int) -> list:
@@ -134,13 +124,15 @@ def load_samples(state_dir: Path, since: float, names: tuple = ("thermal.csv.1",
             parts = line.split(",")
             if len(parts) != 8:
                 continue
-            t = parse_stamp(parts[0])
-            if t is None or t < since:
+            try:
+                t = float(calendar.timegm(time.strptime(parts[0], "%Y-%m-%dT%H:%M:%SZ")))
+            except ValueError:
                 continue
-            rows.append({
-                "t": t, "gpu": _int(parts[1]), "board": _int(parts[2]), "power": _power(parts[3]),
-                "hw": parts[5] == "True", "sw": parts[6] == "True", "status": parts[7],
-            })
+            if t >= since:
+                rows.append({
+                    "t": t, "gpu": _int(parts[1]), "board": _int(parts[2]), "power": _power(parts[3]),
+                    "hw": parts[5] == "True", "sw": parts[6] == "True", "status": parts[7],
+                })
     return rows
 
 
@@ -159,41 +151,32 @@ def _peak(group: list, key: str):
     return max((x[key] for x in group if x[key] is not None), default=None)
 
 
-def summarize(rows: list, now: float, minutes: int, points: int) -> dict:
+def summarize(rows: list, now: float, minutes: int) -> dict:
     if not rows:
-        return {"window_minutes": minutes, "samples": 0, "note": "no readings in this window"}
-    start = now - minutes * 60
-    width = minutes * 60 / points
+        return {"window_minutes": minutes, "samples": 0}
+    start, width = now - minutes * 60, minutes * 60 / SERIES_POINTS
     buckets: dict = {}
     for row in rows:
-        buckets.setdefault(min(int((row["t"] - start) / width), points - 1), []).append(row)
-    series = [
-        {
-            "t": _iso(group[0]["t"]),
-            "gpu_max": _peak(group, "gpu"),
-            "board_max": _peak(group, "board"),
-            "power_max": _peak(group, "power"),
-        }
-        for _, group in sorted(buckets.items())
-    ]
-    gaps = [
-        {"from": _iso(a["t"]), "to": _iso(b["t"]), "seconds": round(b["t"] - a["t"])}
-        for a, b in zip(rows, rows[1:])
-        if b["t"] - a["t"] > GAP_S
-    ]
+        buckets.setdefault(min(int((row["t"] - start) / width), SERIES_POINTS - 1), []).append(row)
     return {
         "window_minutes": minutes,
         "samples": len(rows),
-        "sampling_note": "every 5s when cool and 1s when hot, so means lean towards hot periods",
         "gpu_c": _stats([x["gpu"] for x in rows]),
         "board_c": _stats([x["board"] for x in rows]),
         "power_w": _stats([x["power"] for x in rows]),
         "samples_with_sw_slowdown": sum(x["sw"] for x in rows),
         "samples_with_hw_slowdown": sum(x["hw"] for x in rows),
         "samples_paused": sum(x["status"] == "paused" for x in rows),
-        "gaps_over_60s": gaps,
-        "gaps_note": "a gap means the daemon was not logging: machine off, crashed, or daemon down",
-        "series": series,
+        "gaps_over_60s": [
+            {"from": _iso(a["t"]), "to": _iso(b["t"]), "seconds": round(b["t"] - a["t"])}
+            for a, b in zip(rows, rows[1:])
+            if b["t"] - a["t"] > GAP_S
+        ],
+        "series": [
+            {"t": _iso(g[0]["t"]), "gpu_max": _peak(g, "gpu"), "board_max": _peak(g, "board"),
+             "power_max": _peak(g, "power")}
+            for _, g in sorted(buckets.items())
+        ],
     }
 
 
@@ -223,7 +206,7 @@ def load_events(state_dir: Path, limit: int) -> list:
 
 
 def load_observations(path: Path = OBSERVATIONS_PATH) -> Optional[dict]:
-    """Optional notes from the machine's owner about this hardware, kept out of the code."""
+    """Optional notes from the machine's owner about this hardware."""
     try:
         if path.stat().st_size > OBSERVATIONS_MAX_BYTES:
             return None
@@ -249,7 +232,6 @@ def thermal_status(state_dir: Path = STATE_DIR, now: Optional[float] = None, **_
     state = derive_state(s, now)
     issues = protection_issues(s, state)
     controller = s.get("controller", {})
-    samples = load_samples(state_dir, now - 60, ("thermal.csv",), TREND_TAIL_BYTES)
     return {
         "state": state,
         "protected": not issues,
@@ -259,18 +241,14 @@ def thermal_status(state_dir: Path = STATE_DIR, now: Optional[float] = None, **_
         "board_c": s.get("board_c"),
         "power": s.get("power"),
         "gpu_util": s.get("util"),
-        "trend_last_minute": trend(samples),
+        "trend_last_minute": trend(load_samples(state_dir, now - 60, ("thermal.csv",), TREND_TAIL_BYTES)),
         "sw_thermal_slowdown": s.get("sw_slowdown"),
         "hw_thermal_slowdown": s.get("hw_slowdown"),
-        "container": s.get("container"),
         "container_status": s.get("container_status"),
         "hold": s.get("hold"),
-        "observed_running_for_s": controller.get("running_for_s"),
-        "observed_paused_for_s": controller.get("paused_for_s"),
         "restart_wait_s": controller.get("restart_wait_s"),
         "actions_since_daemon_start": s.get("counts"),
         "reading_age_s": round(now - s.get("updated", 0), 1),
-        "daemon_started": _iso(s["daemon_started"]) if s.get("daemon_started") else None,
     }
 
 
@@ -281,82 +259,52 @@ def thermal_policy(state_dir: Path = STATE_DIR, observations_path: Path = OBSERV
         return {"error": "the daemon has written no configuration; it may be down"}
     return {
         "subject": "Physical hardware temperature of the machine running this LLM, not sampling temperature.",
-        "active_thresholds_c": {
+        "active_limits_c": {
             "pause": {"gpu": cfg["pause_gpu"], "board": cfg["pause_board"], "rule": "either sensor at or above"},
             "resume": {"gpu": cfg["resume_gpu"], "board": cfg["resume_board"], "rule": "both sensors at or below"},
             "kill": {"gpu": cfg["kill_gpu"], "board": cfg["kill_board"], "rule": "either sensor at or above"},
             "start": {"gpu": cfg["start_gpu"], "board": cfg["start_board"], "rule": "both sensors at or below"},
         },
         "timing_s": {key: cfg[key] for key in (
-            "poll_s", "min_pause_s", "max_pause_s", "pause_grace_s", "sensor_loss_s",
-            "cooldown_s", "max_cooldown_s", "early_exit_s", "stable_s",
+            "min_pause_s", "max_pause_s", "sensor_loss_s", "cooldown_s", "max_cooldown_s", "early_exit_s",
         )},
-        "hw_slowdown_samples_before_pause": cfg["hw_slowdown_samples"],
         "states": {
             "normal": "vLLM is running. You can only observe the machine in this state.",
             "paused_cooling": "vLLM is frozen and the model stays loaded. Requests resume afterwards.",
-            "cooldown": "vLLM was killed or failed, and a restart is waiting on a backoff timer.",
-            "waiting_for_cool": "vLLM is stopped until both sensors reach the start thresholds.",
+            "cooldown": "vLLM was killed or failed, and a restart is waiting on a backoff timer that doubles each time.",
+            "waiting_for_cool": "vLLM is stopped until both sensors reach the start limits.",
             "held_off": "A human placed a hold. vLLM will not be started or unpaused automatically.",
             "daemon_down": "The daemon is not updating. Nothing is protecting the machine; tell a human.",
             "unavailable": "The container is missing, or Docker is not answering.",
         },
         "transitions": [
-            {"from": "normal", "to": "paused_cooling",
-             "when": "pause threshold, sustained hardware slowdown, or one sensor missing for sensor_loss_s"},
-            {"from": "paused_cooling", "to": "normal",
-             "when": "both sensors confirm resume thresholds, no hardware slowdown, and min_pause_s elapsed"},
-            {"from": "normal", "to": "cooldown", "when": "kill threshold"},
-            {"from": "paused_cooling", "to": "cooldown",
-             "when": "kill threshold after pause_grace_s, or not cool at max_pause_s"},
-            {"from": "normal or paused_cooling", "to": "cooldown",
-             "when": "both sensors missing for sensor_loss_s, or an exit sooner than early_exit_s"},
-            {"from": "cooldown", "to": "waiting_for_cool",
-             "when": "backoff elapsed; it doubles after each failure up to max_cooldown_s, survives daemon "
-                     "restarts and reboots, and resets after stable_s of running"},
-            {"from": "waiting_for_cool", "to": "normal",
-             "when": "both sensors confirm start thresholds; model reload and autotune run"},
+            "normal -> paused_cooling: pause limit, sustained hardware slowdown, or one sensor missing for sensor_loss_s",
+            "paused_cooling -> normal: resume limits confirmed, no hardware slowdown, and min_pause_s elapsed",
+            "normal or paused_cooling -> cooldown: kill limit, not cool at max_pause_s, both sensors missing, "
+            "or an exit sooner than early_exit_s",
+            "cooldown -> waiting_for_cool -> normal: backoff elapsed, then start limits confirmed; model reload follows",
         ],
-        "headroom_levels": {
-            "basis": "degrees until the nearest pause threshold; a heuristic from this tool, not a daemon rule",
-            "ample": ">= 20", "moderate": "10-19", "low": "< 10", "none": "not in the normal state",
-            "unknown": "a sensor or the daemon is unavailable",
-        },
+        "headroom": "Degrees to the nearest pause limit. ample >= 20, moderate 10-19, low < 10. A heuristic of this "
+                    "tool, not a daemon rule.",
         "what_this_means_for_you": [
             "While paused you are frozen and cannot call tools. You experience a pause only as a time gap, so "
             "after an unexplained delay check thermal_events.",
             "A pause keeps your request and context. A kill loses in-flight requests, and a restart takes several "
             "minutes and is itself the hottest phase, so avoiding kills matters most.",
             "If protected is false, heavy work is unsafe: the daemon may be unable to act. Tell a human.",
-            "These tools are read-only. To change thresholds or take vLLM offline, ask a human.",
+            "These tools are read-only. To change limits or take vLLM offline, ask a human.",
         ],
         "owner_observations": load_observations(observations_path),
     }
 
 
-def thermal_history(state_dir: Path = STATE_DIR, now: Optional[float] = None, minutes: int = 30, points: int = 30, **_) -> dict:
+def thermal_history(state_dir: Path = STATE_DIR, now: Optional[float] = None, minutes: int = 30, **_) -> dict:
     now = time.time() if now is None else now
-    return summarize(load_samples(state_dir, now - minutes * 60), now, minutes, points)
+    return summarize(load_samples(state_dir, now - minutes * 60), now, minutes)
 
 
 def thermal_events(state_dir: Path = STATE_DIR, limit: int = 20, **_) -> dict:
-    return {
-        "events": load_events(state_dir, limit),
-        "event_types": {
-            "pause": "the daemon froze vLLM because of heat or a missing sensor",
-            "unpause": "vLLM resumed after cooling",
-            "kill": "last resort; in-flight requests were lost",
-            "start": "the daemon started vLLM",
-            "container_status": "container state changed, possibly outside the daemon's actions",
-            "sensors": "a temperature sensor was lost or recovered",
-            "config_error": "the config was invalid, so the daemon is using its defaults",
-            "daemon_started": "the daemon began running",
-            "daemon_stopped": "the daemon exited cleanly",
-        },
-        "note": "A daemon_started that follows other events with no daemon_stopped between them suggests a crash or "
-                "power loss. The first event in the log implies nothing: it only marks where logging began. Events "
-                "before that are not recorded here.",
-    }
+    return {"events": load_events(state_dir, limit)}
 
 
 def parse_metrics(text: str) -> dict:
@@ -417,13 +365,10 @@ def _docker_inspect(container: str) -> Optional[dict]:
         p = subprocess.run(
             ["docker", "inspect", "-f", template, container], capture_output=True, text=True, timeout=5,
         )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if p.returncode != 0:
-        return None
-    try:
+        if p.returncode != 0:
+            return None
         state, cmd, image = (json.loads(line) for line in p.stdout.strip().split("\n"))
-    except ValueError:
+    except (OSError, ValueError, subprocess.SubprocessError):
         return None
     return {"state": state, "cmd": cmd or [], "image": image}
 
@@ -436,6 +381,7 @@ def vllm_status(state_dir: Path = STATE_DIR, **_) -> dict:
         return {"serving": False, "container": container, "error": "cannot read the container state"}
     state = info["state"]
     out = {
+        "serving": False,
         "container": container,
         "container_status": state.get("Status"),
         "started_at": state.get("StartedAt"),
@@ -443,13 +389,10 @@ def vllm_status(state_dir: Path = STATE_DIR, **_) -> dict:
         "serve_settings": parse_flags(info["cmd"]),
     }
     if state.get("Status") != "running":
-        return {"serving": False, **out}
-    base_url = s.get("config", {}).get("vllm_url", DEFAULT_VLLM_URL)
+        return out
+    base_url = s.get("config", {}).get("vllm_url", "http://127.0.0.1:8000")
     if _http(base_url, "/health") is None:
-        return {
-            "serving": False, **out,
-            "detail": "the container is running but not answering yet; it is probably loading the model",
-        }
+        return {**out, "detail": "the container is running but not answering; it is probably loading the model"}
     out["serving"] = True
     models = _http(base_url, "/v1/models")
     if models:
@@ -461,17 +404,17 @@ def vllm_status(state_dir: Path = STATE_DIR, **_) -> dict:
             pass
     metrics = _http(base_url, "/metrics")
     if metrics:
-        out["metrics"] = parse_metrics(metrics)
-        out["metrics_note"] = "totals count since this container's process started"
+        out["metrics_since_process_start"] = parse_metrics(metrics)
     return out
 
 
-def _int_prop(description: str, default: int, maximum: int) -> dict:
-    return {"type": "integer", "description": description, "default": default, "minimum": 1, "maximum": maximum}
-
-
-def _schema(properties: Optional[dict] = None) -> dict:
-    return {"type": "object", "properties": properties or {}, "additionalProperties": False}
+def _schema(prop: Optional[str] = None, description: str = "", default: int = 0, maximum: int = 0) -> dict:
+    properties = {}
+    if prop:
+        properties[prop] = {
+            "type": "integer", "description": description, "default": default, "minimum": 1, "maximum": maximum,
+        }
+    return {"type": "object", "properties": properties, "additionalProperties": False}
 
 
 TOOLS: dict = {
@@ -479,17 +422,17 @@ TOOLS: dict = {
         "Current GPU and board temperature, power, daemon state, whether protection is working, degrees of headroom "
         "before vLLM is paused, and the last minute's trend. Check before long or heavy work.")),
     "thermal_policy": (thermal_policy, _schema(), (
-        "The daemon's active thresholds, state machine and transitions, what each state means for you, and the "
-        "owner's notes about this machine. Read once to understand the rules.")),
-    "thermal_history": (thermal_history, _schema({
-        "minutes": _int_prop("How far back to look.", 30, 1440),
-        "points": _int_prop("Maximum points in the time series.", 30, 120),
-    }), "Temperature and power over time: min/max/mean, slowdown counts, logging gaps and a downsampled series. "
-        "Use it to learn how your work affects temperature."),
-    "thermal_events": (thermal_events, _schema({
-        "limit": _int_prop("Maximum events, newest last.", 20, 200),
-    }), "Log of daemon actions (pause, unpause, kill, start) with reasons and readings. Check after an unexplained "
-        "delay, because you cannot observe a pause while it happens."),
+        "The daemon's active limits, state machine, what each state means for you, and the owner's notes about this "
+        "machine. Read once to understand the rules.")),
+    "thermal_history": (thermal_history, _schema("minutes", "How far back to look.", 30, 1440), (
+        "Temperature and power over time, slowdown counts and a downsampled series. Use it to learn how your work "
+        "affects temperature. Readings are every 5s when cool and 1s when hot, so means lean hot. A gap means the "
+        "daemon was not logging: machine off, crashed, or daemon down.")),
+    "thermal_events": (thermal_events, _schema("limit", "Maximum events, newest last.", 20, 200), (
+        "Log of daemon actions: pause, unpause, kill, start, container_status, sensors, config_error, daemon_started, "
+        "daemon_stopped. Check after an unexplained delay, because you cannot observe a pause while it happens. A "
+        "daemon_started following other events with no daemon_stopped between suggests a crash or power loss; the "
+        "first entry implies nothing, as it only marks where logging began.")),
     "vllm_status": (vllm_status, _schema(), (
         "The serving vLLM engine: container state, serve settings, model and context limit, running and waiting "
         "requests, KV cache usage and throughput.")),
@@ -541,7 +484,7 @@ def handle(message: dict, state_dir: Path = STATE_DIR) -> Optional[dict]:
         return _rpc_result(request_id, {
             "protocolVersion": requested if requested in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[0],
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+            "serverInfo": {"name": "vllm-thermald", "version": __version__},
             "instructions": INSTRUCTIONS,
         })
     if method == "ping":
@@ -586,7 +529,3 @@ def serve(state_dir: Path = STATE_DIR) -> int:
             sys.stdout.write(json.dumps(response) + "\n")
             sys.stdout.flush()
     return 0
-
-
-if __name__ == "__main__":
-    sys.exit(serve())
